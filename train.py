@@ -47,6 +47,15 @@ class ExperimentConfig:
     seed: int = SEED
 
 
+def experiment_configurations() -> list[ExperimentConfig]:
+    """Return the main run and the two one-hyperparameter comparisons."""
+    return [
+        ExperimentConfig(name="main"),
+        ExperimentConfig(name="low_learning_rate", learning_rate=0.0001),
+        ExperimentConfig(name="wider_hidden_layers", hidden_sizes=(128, 64)),
+    ]
+
+
 def seed_everything(seed: int) -> None:
     """Seed Python, NumPy, and PyTorch random number generators."""
     random.seed(seed)
@@ -205,22 +214,21 @@ def save_learning_curve(
 def run_experiments(
     output_directory: str | Path = "reports",
     seed: int = SEED,
+    data=None,
+    frame=None,
 ) -> dict[str, Any]:
     """Run baselines and three network configurations using validation only."""
     output_path = Path(output_directory)
     output_path.mkdir(parents=True, exist_ok=True)
-    frame = make_rentals(n=6000, seed=seed)
+    if frame is None:
+        frame = make_rentals(n=6000, seed=seed)
     save_hour_rentals_plot(frame, output_path / "rentals_by_hour.png")
-    data = prepare_data(frame, seed=seed)
+    if data is None:
+        data = prepare_data(frame, seed=seed)
     baselines = evaluate_baselines(data)
 
-    configurations = [
-        ExperimentConfig(name="main"),
-        ExperimentConfig(name="low_learning_rate", learning_rate=0.0001),
-        ExperimentConfig(name="wider_hidden_layers", hidden_sizes=(128, 64)),
-    ]
+    configurations = experiment_configurations()
     experiment_rows: list[dict[str, Any]] = []
-    histories: dict[str, list[dict[str, float | int]]] = {}
 
     for config in configurations:
         seed_everything(config.seed)
@@ -238,8 +246,8 @@ def run_experiments(
             optimizer,
             epochs=config.epochs,
         )
-        histories[config.name] = result.history
-        best_row = result.history[result.best_epoch - 1]
+        checkpoint_row = result.history[result.best_epoch - 1]
+        best_mae_row = min(result.history, key=lambda row: row["validation_mae"])
         last_row = result.history[-1]
         experiment_rows.append(
             {
@@ -255,7 +263,9 @@ def run_experiments(
                     sort_keys=True,
                 ),
                 "best_epoch": result.best_epoch,
-                "best_validation_mae": float(best_row["validation_mae"]),
+                "best_validation_mae": float(best_mae_row["validation_mae"]),
+                "best_validation_mae_epoch": int(best_mae_row["epoch"]),
+                "checkpoint_validation_mae": float(checkpoint_row["validation_mae"]),
                 "best_validation_loss": result.best_validation_loss,
                 "final_training_loss": float(last_row["training_loss"]),
                 "final_validation_loss": float(last_row["validation_loss"]),
@@ -285,6 +295,7 @@ def run_experiments(
                         "validation_loss",
                         "validation_mae",
                     ],
+                    lineterminator="\n",
                 )
                 writer.writeheader()
                 writer.writerows(result.history)
@@ -292,7 +303,11 @@ def run_experiments(
     with (output_path / "experiments.csv").open(
         "w", newline="", encoding="utf-8"
     ) as experiment_file:
-        writer = csv.DictWriter(experiment_file, fieldnames=experiment_rows[0].keys())
+        writer = csv.DictWriter(
+            experiment_file,
+            fieldnames=experiment_rows[0].keys(),
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(experiment_rows)
 
@@ -314,19 +329,137 @@ def run_experiments(
     return report
 
 
-def main() -> None:
-    """Run Phase 4 validation experiments and print their validation metrics."""
-    torch.set_num_threads(1)
-    report = run_experiments()
-    print("Validation MAE (rentals):")
-    for baseline, score in report["baselines"].items():
-        print(f"  {baseline}: {score:.3f}")
-    for row in report["experiments"]:
-        print(
-            f"  {row['name']}: {row['best_validation_mae']:.3f} "
-            f"(best epoch {row['best_epoch']})"
+def finalize_metrics(
+    data,
+    experiment_report: dict[str, Any],
+    output_directory: str | Path = "reports",
+) -> dict[str, Any]:
+    """Retrain the validation-selected network, then score all models on test."""
+    output_path = Path(output_directory)
+    selected_name = experiment_report["selected_neural_network"]
+    selected_config = next(
+        config for config in experiment_configurations() if config.name == selected_name
+    )
+
+    seed_everything(selected_config.seed)
+    train_loader, validation_loader, test_loader = make_dataloaders(
+        data,
+        batch_size=selected_config.batch_size,
+        seed=selected_config.seed,
+    )
+    model = BikeRentalRegressor(
+        input_size=data.X_train.shape[1],
+        hidden_sizes=selected_config.hidden_sizes,
+    )
+    optimizer = Adam(model.parameters(), lr=selected_config.learning_rate)
+    training_result = train_model(
+        model,
+        train_loader,
+        validation_loader,
+        optimizer,
+        epochs=selected_config.epochs,
+    )
+
+    # train_model restores its best validation-loss checkpoint before scoring.
+    _, selected_validation_mae = run_epoch(model, validation_loader)
+    _, selected_test_mae = run_epoch(model, test_loader)
+
+    training_mean = float(np.mean(data.y_train))
+    mean_validation_mae = float(
+        mean_absolute_error(
+            data.y_validation,
+            np.full_like(data.y_validation, training_mean),
         )
-    print(f"Selected neural network: {report['selected_neural_network']}")
+    )
+    mean_test_mae = float(
+        mean_absolute_error(
+            data.y_test,
+            np.full_like(data.y_test, training_mean),
+        )
+    )
+
+    linear_model = LinearRegression()
+    linear_model.fit(data.X_train, data.y_train.ravel())
+    linear_validation_predictions = linear_model.predict(data.X_validation)
+    linear_test_predictions = linear_model.predict(data.X_test)
+    linear_validation_mae = float(
+        mean_absolute_error(data.y_validation.ravel(), linear_validation_predictions)
+    )
+    linear_test_mae = float(
+        mean_absolute_error(data.y_test.ravel(), linear_test_predictions)
+    )
+
+    metrics = {
+        "dataset": {
+            "rows": len(data.train_indices)
+            + len(data.validation_indices)
+            + len(data.test_indices),
+            "split_sizes": {
+                "train": len(data.train_indices),
+                "validation": len(data.validation_indices),
+                "test": len(data.test_indices),
+            },
+        },
+        "baselines": {
+            "training_mean": {
+                "validation_mae": mean_validation_mae,
+                "test_mae": mean_test_mae,
+            },
+            "linear_regression": {
+                "validation_mae": linear_validation_mae,
+                "test_mae": linear_test_mae,
+            },
+        },
+        "selected_neural_network": {
+            "configuration": {
+                "name": selected_config.name,
+                "hidden_sizes": list(selected_config.hidden_sizes),
+                "learning_rate": selected_config.learning_rate,
+                "batch_size": selected_config.batch_size,
+                "epochs": selected_config.epochs,
+                "seed": selected_config.seed,
+            },
+            "best_epoch": training_result.best_epoch,
+            "validation_mae": selected_validation_mae,
+            "test_mae": selected_test_mae,
+        },
+        "selection_metric": "validation_mae",
+        "reproducibility": {
+            "seed": selected_config.seed,
+            "python_numpy_torch_seeded": True,
+            "dataloader_seed": selected_config.seed,
+            "training_loader_shuffled_only": True,
+            "torch_num_threads": torch.get_num_threads(),
+            "device": "cpu",
+        },
+    }
+    with (output_path / "metrics.json").open("w", encoding="utf-8") as metrics_file:
+        json.dump(metrics, metrics_file, indent=2)
+        metrics_file.write("\n")
+    return metrics
+
+
+def main() -> None:
+    """Recreate experiment artifacts and the final held-out test report."""
+    torch.set_num_threads(1)
+    frame = make_rentals(n=6000, seed=SEED)
+    data = prepare_data(frame, seed=SEED)
+    experiment_report = run_experiments(data=data, frame=frame)
+    metrics = finalize_metrics(data, experiment_report)
+
+    print("MAE (rentals):")
+    for model_name, scores in metrics["baselines"].items():
+        print(
+            f"  {model_name}: validation={scores['validation_mae']:.3f}, "
+            f"test={scores['test_mae']:.3f}"
+        )
+    network_metrics = metrics["selected_neural_network"]
+    print(
+        f"  {network_metrics['configuration']['name']}: "
+        f"validation={network_metrics['validation_mae']:.3f}, "
+        f"test={network_metrics['test_mae']:.3f} "
+        f"(best epoch {network_metrics['best_epoch']})"
+    )
 
 
 if __name__ == "__main__":
