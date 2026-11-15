@@ -10,9 +10,7 @@ from torch import nn
 class BikeRentalRegressor(nn.Module):
     """Predict one unrestricted rental count using configurable hidden layers."""
 
-    def __init__(
-        self, input_size: int, hidden_sizes: Sequence[int] = (64, 32)
-    ) -> None:
+    def __init__(self, input_size: int, hidden_sizes: Sequence[int] = (64, 32)) -> None:
         super().__init__()
         if input_size < 1:
             raise ValueError("input_size must be positive.")
